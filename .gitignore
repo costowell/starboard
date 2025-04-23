@@ -1,7 +1,5 @@
-starboard.db
 pnpm-debug.log
 .tern-port
-secrets.json
 package-lock.json
 *~
 \#*\#
@@ -10,3 +8,4 @@ yarn-error.log
 npm-error.log
 /.vscode
 /.idea
+.env

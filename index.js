@@ -1,15 +1,25 @@
-const Bolt = require("@slack/bolt");
-const secrets = require("./secrets.json");
-const db = require("better-sqlite3")(__dirname + "/starboard.db");
+import bolt from "@slack/bolt";
+const { App } = bolt;
+import postgres from 'postgres'
+import 'dotenv/config'
 
-const STARBOARD_CHANNEL = secrets.starboardChannel;
-const REACTION_NAME = secrets.reactionName || "star";
+const sql = postgres({
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  username: process.env.DB_USERNAME,
+  password: process.env.DB_PASSWORD
+})
+
+const STARBOARD_CHANNEL = process.env.STARBOARD_CHANNEL;
+const REACTION_NAME = process.env.REACTION_NAME || "star";
 const EMOJI = "⭐";
-const BOTSPAM_CHANNEL = secrets.botspamChannel;
+const BOTSPAM_CHANNEL = process.env.BOTSPAM_CHANNEL;
 
-const app = new Bolt.App({
-  token: secrets.slackToken,
-  appToken: secrets.slackAppToken,
+const CONSTRAINT_UNIQUE = "23505";
+
+const app = new App({
+  token: process.env.SLACK_TOKEN,
+  appToken: process.env.SLACK_APP_TOKEN,
   socketMode: true,
 });
 
@@ -29,15 +39,13 @@ async function resolveMessage(ctx) {
   let channel = ctx.payload.item.channel;
 
   if (ctx.payload.item.channel == STARBOARD_CHANNEL) {
-    const response = db
-      .prepare("SELECT messageId, channelId FROM posts WHERE postId == ?")
-      .get(ctx.payload.item.ts);
-    if (response) {
-      messageId = response.messageId;
-      channel = response.channelId;
+    const response = await sql`SELECT messageId, channelId FROM posts WHERE postId = ${ctx.payload.item.ts}`;
+    if (response.length > 0) {
+      messageId = response[0].messageId;
+      channel = response[0].channelId;
     }
   }
-  const {messages} = await ctx.client.conversations.replies({
+  const { messages } = await ctx.client.conversations.replies({
     channel,
     ts: messageId,
     latest: messageId,
@@ -56,7 +64,7 @@ async function resolveMessage(ctx) {
   // No self-starring
   if (messages[0].user == ctx.payload.user) return;
 
-  const {user} = await ctx.client.users.info({
+  const { user } = await ctx.client.users.info({
     user: ctx.payload.user,
   });
 
@@ -81,11 +89,9 @@ app.event("reaction_added", async (ctx) => {
   console.log("Star reaction added");
 
   try {
-    db.prepare(
-      "INSERT INTO stars (messageId, authorId, channelId) VALUES (?, ?, ?)"
-    ).run(resolution.messageId, ctx.payload.user, resolution.channel);
+    await sql`INSERT INTO stars (messageId, authorId, channelId) VALUES (${resolution.messageId}, ${ctx.payload.user}, ${resolution.channel})`;
   } catch (err) {
-    if (err.code == "SQLITE_CONSTRAINT_UNIQUE") {
+    if (err.code == CONSTRAINT_UNIQUE) {
       return;
     } else {
       throw err;
@@ -93,9 +99,7 @@ app.event("reaction_added", async (ctx) => {
   }
 
   try {
-    db.prepare("INSERT INTO tips (tipId, userId) VALUES ('first_star', ?)").run(
-      ctx.payload.user
-    );
+    await sql`INSERT INTO tips (tipId, userId) VALUES ('first_star', ${ctx.payload.user})`;
     try {
       await ctx.client.chat.postMessage({
         channel: ctx.payload.user,
@@ -110,7 +114,7 @@ You're free to participate by ${EMOJI}-ing messages as you wish without being in
     }
   } catch (err) {
     // Already has tip!
-    if (err.code != "SQLITE_CONSTRAINT_UNIQUE") {
+    if (err.code != CONSTRAINT_UNIQUE) {
       throw err;
     }
   }
@@ -128,10 +132,8 @@ app.event("reaction_removed", async (ctx) => {
   const resolution = await resolveMessage(ctx);
   if (!resolution) return;
 
-  db.prepare(
-    "DELETE FROM stars WHERE messageId = ? AND authorId = ? AND channelId = ?"
-  ).run(resolution.messageId, ctx.payload.user, resolution.channel);
 
+  await sql`DELETE FROM stars WHERE messageId = ${resolution.messageId} AND authorId = ${ctx.payload.user} AND channelId = ${resolution.channel}`;
   console.log("Star reaction removed");
 
   await updateStarboard({
@@ -174,16 +176,13 @@ app.shortcut("reload_stars", async (ctx) => {
 
   const users = new Set(star?.users);
 
-  const postId = db
-    .prepare("SELECT postId FROM posts WHERE messageId == ?")
-    .pluck()
-    .get(resolution.messageId);
+  let postId = await sql`SELECT postId FROM posts WHERE messageId = ${resolution.messageId}`;
 
-  if (postId) {
+  if (postId.length > 0) {
     const channelReactions = await ctx.client.reactions.get({
       full: true,
       channel: STARBOARD_CHANNEL,
-      timestamp: postId,
+      timestamp: postId[0],
     });
     const star = channelReactions.message.reactions?.find(
       (reaction) => reaction.name == REACTION_NAME
@@ -196,21 +195,15 @@ app.shortcut("reload_stars", async (ctx) => {
   }
 
   // Get rid of old stars:
-  db.prepare("DELETE FROM stars WHERE messageId == ? AND channelId == ?").run(
-    resolution.messageId,
-    resolution.channel
-  );
+  await sql`DELETE FROM stars WHERE messageId = ${resolution.messageId} AND channelId = ${resolution.channel}`
 
   for (const user of users) {
     // No self-starring
     if (user == message.user) continue;
     try {
-      db.prepare(
-        "INSERT INTO stars (messageId, authorId, channelId) VALUES (?, ?, ?)"
-      ).run(resolution.messageId, user, resolution.channel);
+      await sql`INSERT INTO stars (messageId, authorId, channelId) VALUES (${resolution.messageId}, ${user}, ${resolution.channel})`;
     } catch (err) {
       if (err.code != "SQLITE_CONSTRAINT_UNIQUE") {
-        console.log(err.code);
         throw err;
       }
     }
@@ -232,31 +225,25 @@ async function updateStarboard({
   message,
   client,
 }) {
-  const postId = db
-    .prepare("SELECT postId FROM posts WHERE messageId == ?")
-    .pluck()
-    .get(messageId);
-  const count = db
-    .prepare("SELECT COUNT(*) FROM stars WHERE messageId == ?")
-    .pluck()
-    .get(messageId);
+  const postId = await sql`SELECT postId FROM posts WHERE messageId = ${messageId}`
+  let count = await sql`SELECT COUNT(*) FROM stars WHERE messageId = ${messageId}`;
+  count = count.length > 0 ? count[0].count : 0;
 
   console.log(count, postId);
 
   const minimumStarCount = message.thread_ts ? 1 : 3;
-
   if (count >= minimumStarCount) {
-    const {permalink} = await client.chat.getPermalink({
+    const { permalink } = await client.chat.getPermalink({
       channel: channelId,
       message_ts: messageId,
     });
     const content = `${EMOJI} *${count}* <#${channelId}>
 
 ${permalink}`;
-    if (postId) {
+    if (postId.length > 0) {
       await client.chat.update({
         channel: STARBOARD_CHANNEL,
-        ts: postId,
+        ts: postId[0],
         text: content,
       });
     } else {
@@ -265,9 +252,7 @@ ${permalink}`;
         text: content,
       });
       try {
-        db.prepare(
-          "INSERT INTO tips (tipId, userId) VALUES ('entered_starboard', ?)"
-        ).run(authorId);
+        await sql`INSERT INTO tips (tipId, userId) VALUES ('entered_starboard', ${authorId})`;
         try {
           await client.chat.postMessage({
             channel: authorId,
@@ -279,24 +264,24 @@ Feel free to join <#${STARBOARD_CHANNEL}> to look at other people's ${EMOJI}'d p
           console.error(`Couldn't PM ${authorId} tip!`, err);
         }
       } catch (err) {
-        if (err.code != "SQLITE_CONSTRAINT_UNIQUE") {
+        if (err.code != CONSTRAINT_UNIQUE) {
           throw err;
         }
       }
-      db.prepare(
-        "INSERT INTO posts (messageId, channelId, postId, authorId) VALUES (?, ?, ?, ?)"
-      ).run(messageId, channelId, response.message.ts, authorId);
+      let r = await sql`INSERT INTO posts (messageId, channelId, postId, authorId) VALUES (${messageId}, ${channelId}, ${response.message.ts}, ${authorId})`
+      console.log({ r })
     }
-  } else if (postId) {
+  } else if (postId.length > 0) {
     await client.chat.delete({
       channel: STARBOARD_CHANNEL,
-      ts: postId,
+      ts: postId[0],
     });
-    db.prepare("DELETE FROM posts WHERE messageId == ?").run(messageId);
+    await sql`DELETE FROM posts WHERE messageId = ${messageId}`
   }
 }
 
 function topUsers(sectionTitle, users) {
+  console.log(users);
   return [
     {
       type: "header",
@@ -310,13 +295,13 @@ function topUsers(sectionTitle, users) {
       type: "section",
       fields: users.map((user) => ({
         type: "mrkdwn",
-        text: `<@${user.authorId}> — ${user.count} ${EMOJI}`,
+        text: `<@${user.authorid}> — ${user.count} ${EMOJI}`,
       })),
     },
   ];
 }
 
-app.command("/stargazers", async ({command, ack, client, respond, payload}) => {
+app.command("/stargazers", async ({ command, ack, client, respond, payload }) => {
   await ack();
 
   if (payload.channel_id != BOTSPAM_CHANNEL) {
@@ -324,21 +309,19 @@ app.command("/stargazers", async ({command, ack, client, respond, payload}) => {
     return;
   }
 
-  const topAuthors = db
-    .prepare(
-      "SELECT posts.authorId, COUNT(*) AS count FROM stars JOIN posts WHERE stars.messageId = posts.messageId GROUP BY posts.authorId ORDER BY count DESC LIMIT 10"
-    )
-    .all();
-  const topStarrers = db
-    .prepare(
-      "SELECT authorId, COUNT(*) as count FROM stars GROUP BY authorId ORDER BY count desc LIMIT 10"
-    )
-    .all();
-  const topPosts = db
-    .prepare(
-      "SELECT posts.authorId, posts.channelId, posts.messageId, COUNT(stars.authorId) AS count FROM posts JOIN stars WHERE stars.messageId = posts.messageId GROUP BY posts.messageId ORDER BY count DESC LIMIT 5"
-    )
-    .all();
+  const topAuthors = await sql`
+    SELECT posts.authorId, COUNT(*) AS count
+    FROM stars
+    LEFT JOIN posts ON stars.messageid = posts.messageid
+    WHERE posts.authorId IS NOT NULL
+    GROUP BY posts.authorId
+    ORDER BY count DESC
+    LIMIT 10
+  `;
+  const topStarrers = await sql`SELECT authorId, COUNT(*) as count FROM stars GROUP BY authorId ORDER BY count desc LIMIT 10`;
+  const topPosts = await sql`SELECT posts.authorId, posts.channelId, posts.messageId, COUNT(stars.authorId) AS count FROM posts JOIN stars ON stars.messageId = posts.messageId GROUP BY posts.messageId ORDER BY count DESC LIMIT 5`;
+
+  console.log({ topAuthors, topStarrers, topPosts })
 
   await respond({
     response_type: "in_channel",
@@ -363,13 +346,12 @@ app.command("/stargazers", async ({command, ack, client, respond, payload}) => {
             fields: [
               {
                 type: "mrkdwn",
-                text: `${EMOJI} *${post.count}* <#${post.channelId}> — <@${
-                  post.authorId
-                }>: ${await getPermalink(
-                  post.channelId,
-                  post.messageId,
-                  client
-                )}`,
+                text: `${EMOJI} *${post.count}* <#${post.channelid}> — <@${post.authorid
+                  }>: ${await getPermalink(
+                    post.channelid,
+                    post.messageid,
+                    client
+                  )}`,
               },
             ],
           },
@@ -380,7 +362,8 @@ app.command("/stargazers", async ({command, ack, client, respond, payload}) => {
 });
 
 async function getPermalink(channelId, messageId, client) {
-  const {permalink} = await client.chat.getPermalink({
+  console.log({ channelId, messageId })
+  const { permalink } = await client.chat.getPermalink({
     channel: channelId,
     message_ts: messageId,
   });
